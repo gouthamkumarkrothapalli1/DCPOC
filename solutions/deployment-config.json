@@ -1,0 +1,12 @@
+{
+  "connectionReferences": {
+    "shared_commondataserviceforapps": {
+      "connectionId": "",
+      "connectorId": "/providers/Microsoft.PowerApps/apis/shared_commondataserviceforapps"
+    }
+  },
+  "environmentVariables": {
+    "env_var_example": "value_here"
+  },
+  "componentMappings": {}
+}
