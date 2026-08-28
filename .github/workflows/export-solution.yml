@@ -1,6 +1,6 @@
 name: Export Solution To Feature Branch
 
-run-name: Export ${{ inputs.solution_name }} to feature/${{ inputs.target_branch }} [${{ inputs.run_mode }}]
+run-name: Export ${{ inputs.solution_name }} to feature/${{ inputs.target_branch }}
 
 on:
   workflow_dispatch:
@@ -15,78 +15,101 @@ on:
         required: true
         type: string
 
-      run_mode:
-        description: "a: Restart from start / b: Continue from failed step"
-        required: true
-        type: choice
-        default: restart
-        options:
-          - restart
-          - continue
-
 permissions:
   contents: write
 
 concurrency:
-  group: powerplatform-export-feature-branch
+  group: powerplatform-export-${{ inputs.solution_name }}
   cancel-in-progress: false
 
-env:
-  PROGRESS_FILE: .step-progress/completed.txt
-  DEPLOYMENT_CONFIG: solutions/deployment-config.json
-
+# ════════════════════════════════════════════════════
+# Job 1 — Verify branch & validate deployment config
+# ════════════════════════════════════════════════════
 jobs:
-  export-solution:
+  verify-and-validate:
     runs-on: ubuntu-latest
-
+    outputs:
+      target_branch: feature/${{ inputs.target_branch }}
+      solution_name: ${{ inputs.solution_name }}
     steps:
-      # ──────────────────────────────────────────────
-      # Progress & Resume
-      # ──────────────────────────────────────────────
-      - name: Restore Progress (continue mode)
-        if: inputs.run_mode == 'continue'
-        uses: actions/cache/restore@v4
-        with:
-          path: .step-progress
-          key: export-progress-${{ inputs.solution_name }}-${{ inputs.target_branch }}
-
-      - name: Load Completed Steps
-        id: done
-        shell: bash
-        run: |
-          mkdir -p .step-progress
-          if [[ "${{ inputs.run_mode }}" == "continue" && -f "$PROGRESS_FILE" ]]; then
-            echo "Resuming. Previously completed:"
-            cat "$PROGRESS_FILE"
-            while IFS= read -r s; do echo "${s}=true" >> "$GITHUB_OUTPUT"; done < "$PROGRESS_FILE"
-          else
-            > "$PROGRESS_FILE"
-            echo "Starting fresh."
-          fi
-
-      - name: Set Variables
-        shell: bash
-        run: |
-          echo "SOLUTION_NAME=${{ inputs.solution_name }}" >> "$GITHUB_ENV"
-          echo "TARGET_BRANCH=feature/${{ inputs.target_branch }}" >> "$GITHUB_ENV"
-
-      # ──────────────────────────────────────────────
-      # Branch Verification & Checkout
-      # ──────────────────────────────────────────────
       - name: Verify Target Feature Branch Exists
-        if: steps.done.outputs.verify_branch != 'true'
-        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          TARGET="feature/${{ inputs.target_branch }}"
           if ! git ls-remote --exit-code --heads \
             "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" \
-            "refs/heads/${TARGET_BRANCH}" > /dev/null 2>&1; then
-            echo "::error::Branch '${TARGET_BRANCH}' does not exist. Create it first."
+            "refs/heads/${TARGET}" > /dev/null 2>&1; then
+            echo "::error::Branch '${TARGET}' does not exist. Create it first."
             exit 1
           fi
-          echo "verify_branch" >> "$PROGRESS_FILE"
+          echo "✅ Branch '${TARGET}' exists."
 
+      - name: Checkout Target Feature Branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/${{ inputs.target_branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate Deployment Config JSON
+        shell: bash
+        run: |
+          CONFIG="solutions/deployment-config.json"
+          if [[ ! -f "$CONFIG" ]]; then
+            echo "::error::deployment-config.json not found. Create it at solutions/deployment-config.json"
+            exit 1
+          fi
+          if ! jq empty "$CONFIG" 2>/dev/null; then
+            echo "::error::deployment-config.json is not valid JSON."
+            exit 1
+          fi
+          echo "✅ Deployment config is valid."
+
+      - name: Verify Connection References in Config
+        shell: bash
+        run: |
+          CONFIG="solutions/deployment-config.json"
+          ERRORS=0
+
+          CONNREFS=$(jq -r '.connectionReferences | keys[]' "$CONFIG" 2>/dev/null || echo "")
+          if [[ -z "$CONNREFS" ]]; then
+            echo "⚠️  No connection references in config. Skipping."
+            exit 0
+          fi
+
+          while IFS= read -r connref; do
+            CONNECTOR_ID=$(jq -r ".connectionReferences[\"$connref\"].connectorId // empty" "$CONFIG")
+            CONNECTION_ID=$(jq -r ".connectionReferences[\"$connref\"].connectionId // empty" "$CONFIG")
+
+            if [[ -z "$CONNECTOR_ID" ]]; then
+              echo "::error::❌ '$connref' missing connectorId in deployment-config.json"
+              ERRORS=$((ERRORS + 1))
+            fi
+            if [[ -z "$CONNECTION_ID" ]]; then
+              echo "::error::❌ '$connref' missing connectionId in deployment-config.json"
+              ERRORS=$((ERRORS + 1))
+            fi
+            if [[ -n "$CONNECTOR_ID" && -n "$CONNECTION_ID" ]]; then
+              echo "  ✅ $connref → OK"
+            fi
+          done <<< "$CONNREFS"
+
+          if [[ $ERRORS -gt 0 ]]; then
+            echo "::error::$ERRORS connection reference error(s). Fix deployment-config.json."
+            exit 1
+          fi
+          echo "✅ All connection references verified."
+
+  # ════════════════════════════════════════════════════
+  # Job 2 — Export solution from Dataverse
+  # ════════════════════════════════════════════════════
+  export-solution:
+    needs: verify-and-validate
+    runs-on: ubuntu-latest
+    env:
+      SOLUTION_NAME: ${{ inputs.solution_name }}
+    steps:
       - name: Checkout Target Feature Branch
         uses: actions/checkout@v4
         with:
@@ -94,134 +117,29 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ──────────────────────────────────────────────
-      # Deployment Config – Connection References,
-      # Mappings & Environment Variables via JSON
-      # ──────────────────────────────────────────────
-      - name: Ensure Deployment Config JSON Exists
-        if: steps.done.outputs.ensure_config != 'true'
-        shell: bash
-        run: |
-          if [[ ! -f "$DEPLOYMENT_CONFIG" ]]; then
-            echo "No deployment-config.json found – creating template."
-            mkdir -p "$(dirname "$DEPLOYMENT_CONFIG")"
-            cat > "$DEPLOYMENT_CONFIG" << 'JSONEOF'
-          {
-            "connectionReferences": {
-              "shared_commondataserviceforapps": {
-                "connectionId": "",
-                "connectorId": "/providers/Microsoft.PowerApps/apis/shared_commondataserviceforapps"
-              }
-            },
-            "environmentVariables": {
-              "env_var_name": "env_var_value"
-            },
-            "componentMappings": {}
-          }
-          JSONEOF
-          fi
-          echo "ensure_config" >> "$PROGRESS_FILE"
-
-      - name: Load Deployment Config
-        id: config
-        shell: bash
-        run: |
-          echo "Loading deployment configuration from $DEPLOYMENT_CONFIG"
-          if [[ ! -f "$DEPLOYMENT_CONFIG" ]]; then
-            echo "::error::Deployment config file not found at $DEPLOYMENT_CONFIG"
-            exit 1
-          fi
-          # Validate JSON is well-formed
-          if ! jq empty "$DEPLOYMENT_CONFIG" 2>/dev/null; then
-            echo "::error::Deployment config is not valid JSON."
-            exit 1
-          fi
-          echo "config_path=$DEPLOYMENT_CONFIG" >> "$GITHUB_OUTPUT"
-          echo "✅ Deployment config loaded and validated."
-
-      # ──────────────────────────────────────────────
-      # Authentication
-      # ──────────────────────────────────────────────
       - name: Install Power Platform CLI
         uses: microsoft/powerplatform-actions/actions-install@v1
 
       - name: Authenticate to Dataverse
-        shell: bash
-        run: |
-          $POWERPLATFORMTOOLS_PACPATH auth create \
-            --applicationId "${{ vars.POWERPLATFORM_APP_ID }}" \
-            --clientSecret "${{ secrets.POWERPLATFORM_CLIENT_SECRET }}" \
-            --tenant "${{ vars.POWERPLATFORM_TENANT_ID }}" \
-            --environment "${{ vars.DEV_ENV_URL }}"
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 15
+          timeout_minutes: 5
+          command: |
+            $POWERPLATFORMTOOLS_PACPATH auth create \
+              --applicationId "${{ vars.POWERPLATFORM_APP_ID }}" \
+              --clientSecret "${{ secrets.POWERPLATFORM_CLIENT_SECRET }}" \
+              --tenant "${{ vars.POWERPLATFORM_TENANT_ID }}" \
+              --environment "${{ vars.DEV_ENV_URL }}"
 
-      # ──────────────────────────────────────────────
-      # Verify Connection References Before Export
-      # ──────────────────────────────────────────────
-      - name: Verify Connection References
-        if: steps.done.outputs.verify_connrefs != 'true'
-        shell: bash
-        run: |
-          echo "=========================================="
-          echo "  Verifying Connection References"
-          echo "=========================================="
-
-          ERRORS=0
-
-          # Extract expected connection references from config
-          EXPECTED_CONNREFS=$(jq -r '.connectionReferences | keys[]' "$DEPLOYMENT_CONFIG" 2>/dev/null || echo "")
-
-          if [[ -z "$EXPECTED_CONNREFS" ]]; then
-            echo "⚠️  No connection references defined in deployment config."
-            echo "verify_connrefs" >> "$PROGRESS_FILE"
-            exit 0
-          fi
-
-          # List active connections from the environment
-          echo "Fetching active connections from environment..."
-          ACTIVE_CONNECTIONS=$($POWERPLATFORMTOOLS_PACPATH connection list 2>/dev/null || echo "FETCH_FAILED")
-
-          if [[ "$ACTIVE_CONNECTIONS" == "FETCH_FAILED" ]]; then
-            echo "::warning::Could not fetch active connections. Proceeding with config-only validation."
-          fi
-
-          while IFS= read -r connref; do
-            CONNECTOR_ID=$(jq -r ".connectionReferences[\"$connref\"].connectorId // empty" "$DEPLOYMENT_CONFIG")
-            CONNECTION_ID=$(jq -r ".connectionReferences[\"$connref\"].connectionId // empty" "$DEPLOYMENT_CONFIG")
-
-            if [[ -z "$CONNECTOR_ID" ]]; then
-              echo "::error::❌ Connection reference '$connref' is missing 'connectorId' in deployment config."
-              ERRORS=$((ERRORS + 1))
-            fi
-
-            if [[ -z "$CONNECTION_ID" ]]; then
-              echo "::error::❌ Connection reference '$connref' is missing 'connectionId' in deployment config. A valid connection must be provided."
-              ERRORS=$((ERRORS + 1))
-            fi
-
-            if [[ -n "$CONNECTOR_ID" && -n "$CONNECTION_ID" ]]; then
-              echo "  ✅ $connref → connector=$CONNECTOR_ID, connection=$CONNECTION_ID"
-            fi
-          done <<< "$EXPECTED_CONNREFS"
-
-          echo "=========================================="
-          if [[ $ERRORS -gt 0 ]]; then
-            echo "::error::$ERRORS connection reference error(s) found. Fix deployment-config.json before proceeding."
-            exit 1
-          fi
-
-          echo "✅ All connection references verified."
-          echo "verify_connrefs" >> "$PROGRESS_FILE"
-
-      # ──────────────────────────────────────────────
-      # Export Solution
-      # ──────────────────────────────────────────────
       - name: Generate Versioned File Name
         shell: bash
         run: |
           TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
-          VERSIONED_FILE_NAME="${SOLUTION_NAME}_${TIMESTAMP}_Run${{ github.run_number }}.zip"
-          echo "VERSIONED_FILE_NAME=${VERSIONED_FILE_NAME}" >> "$GITHUB_ENV"
-          echo "TEMP_ZIP_PATH=${RUNNER_TEMP}/${VERSIONED_FILE_NAME}" >> "$GITHUB_ENV"
+          VERSIONED="${SOLUTION_NAME}_${TIMESTAMP}_Run${{ github.run_number }}.zip"
+          echo "VERSIONED_FILE_NAME=${VERSIONED}" >> "$GITHUB_ENV"
+          echo "TEMP_ZIP_PATH=${RUNNER_TEMP}/${VERSIONED}" >> "$GITHUB_ENV"
 
       - name: Create Folder Structure
         shell: bash
@@ -230,25 +148,24 @@ jobs:
           mkdir -p "solutions/unmanaged/${SOLUTION_NAME}/src"
 
       - name: Export Unmanaged Solution
-        if: steps.done.outputs.export != 'true'
-        shell: bash
-        run: |
-          $POWERPLATFORMTOOLS_PACPATH solution export \
-            --name "${SOLUTION_NAME}" \
-            --path "${TEMP_ZIP_PATH}" \
-            --managed false
-          [[ -f "${TEMP_ZIP_PATH}" ]] || { echo "::error::Export failed."; exit 1; }
-          echo "export" >> "$PROGRESS_FILE"
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 30
+          timeout_minutes: 15
+          command: |
+            $POWERPLATFORMTOOLS_PACPATH solution export \
+              --name "${SOLUTION_NAME}" \
+              --path "${TEMP_ZIP_PATH}" \
+              --managed false
+            [[ -f "${TEMP_ZIP_PATH}" ]] || { echo "::error::Export failed."; exit 1; }
 
-      - name: Save Versioned Solution ZIP
-        if: steps.done.outputs.save_zip != 'true'
+      - name: Save Versioned ZIP
         shell: bash
         run: |
           cp "${TEMP_ZIP_PATH}" "solutions/unmanaged/${SOLUTION_NAME}/versions/${VERSIONED_FILE_NAME}"
-          echo "save_zip" >> "$PROGRESS_FILE"
 
       - name: Unpack Solution
-        if: steps.done.outputs.unpack != 'true'
         shell: bash
         run: |
           rm -rf "solutions/unmanaged/${SOLUTION_NAME}/src"
@@ -257,24 +174,41 @@ jobs:
             --zipfile "${TEMP_ZIP_PATH}" \
             --folder "solutions/unmanaged/${SOLUTION_NAME}/src" \
             --packagetype Unmanaged
-          echo "unpack" >> "$PROGRESS_FILE"
 
-      # ──────────────────────────────────────────────
-      # Validate Solution Components –
-      # Ensure connection refs in flows belong to solution
-      # ──────────────────────────────────────────────
-      - name: Validate Connection References in Solution
-        if: steps.done.outputs.validate_connrefs_in_solution != 'true'
+      - name: Upload Solution Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solution-export
+          path: |
+            solutions/unmanaged/${{ inputs.solution_name }}/
+          retention-days: 7
+
+      - name: Clear Authentication
+        if: always()
+        shell: bash
+        run: $POWERPLATFORMTOOLS_PACPATH auth clear || true
+
+  # ════════════════════════════════════════════════════
+  # Job 3 — Validate connection refs in cloud flows
+  # ════════════════════════════════════════════════════
+  validate-solution:
+    needs: export-solution
+    runs-on: ubuntu-latest
+    env:
+      SOLUTION_NAME: ${{ inputs.solution_name }}
+    steps:
+      - name: Download Solution Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: solution-export
+          path: solutions/unmanaged/${{ inputs.solution_name }}/
+
+      - name: Validate Connection References in Cloud Flows
         shell: bash
         run: |
-          echo "=========================================="
-          echo "  Validating Connection References in Cloud Flows"
-          echo "=========================================="
-
           SRC_DIR="solutions/unmanaged/${SOLUTION_NAME}/src"
           ERRORS=0
 
-          # Collect connection references defined in the solution
           SOLUTION_CONNREFS=$(find "$SRC_DIR" -path "*/connectionreferences/*" -name "*.json" 2>/dev/null \
             | xargs -I{} jq -r '.connectionreferenceid // .name // empty' {} 2>/dev/null \
             | sort -u || echo "")
@@ -282,18 +216,15 @@ jobs:
           echo "Connection references in solution:"
           echo "$SOLUTION_CONNREFS" | sed 's/^/  • /'
 
-          # Find cloud flows and check their connection references
           FLOW_FILES=$(find "$SRC_DIR" -path "*/Workflows/*" -name "*.json" 2>/dev/null || echo "")
-
           if [[ -n "$FLOW_FILES" ]]; then
             while IFS= read -r flow_file; do
               FLOW_NAME=$(basename "$flow_file" .json)
               FLOW_CONNREFS=$(jq -r '.. | .connectionReferenceName? // empty' "$flow_file" 2>/dev/null | sort -u || echo "")
-
               if [[ -n "$FLOW_CONNREFS" ]]; then
                 while IFS= read -r ref; do
                   if ! echo "$SOLUTION_CONNREFS" | grep -qF "$ref"; then
-                    echo "::error::❌ Cloud flow '$FLOW_NAME' references connection '$ref' which is NOT in the solution. Add it to the solution."
+                    echo "::error::❌ Flow '$FLOW_NAME' uses connection '$ref' NOT in the solution."
                     ERRORS=$((ERRORS + 1))
                   fi
                 done <<< "$FLOW_CONNREFS"
@@ -302,176 +233,161 @@ jobs:
           fi
 
           if [[ $ERRORS -gt 0 ]]; then
-            echo "::error::$ERRORS unrelated connection reference(s) found in cloud flows. Include them in the solution."
+            echo "::error::$ERRORS unrelated connection reference(s). Add them to the solution."
             exit 1
           fi
-          echo "✅ All connection references in cloud flows are part of the solution."
-          echo "validate_connrefs_in_solution" >> "$PROGRESS_FILE"
+          echo "✅ All connection references in flows are part of the solution."
 
-      # ──────────────────────────────────────────────
-      # Prepare Deployment Settings JSON for Import
-      # (Connection refs, env vars, mappings)
-      # ──────────────────────────────────────────────
-      - name: Generate Deployment Settings File
-        if: steps.done.outputs.gen_settings != 'true'
+  # ════════════════════════════════════════════════════
+  # Job 4 — Import, publish & activate all components
+  # ════════════════════════════════════════════════════
+  import-and-activate:
+    needs: validate-solution
+    runs-on: ubuntu-latest
+    env:
+      SOLUTION_NAME: ${{ inputs.solution_name }}
+    steps:
+      - name: Checkout Target Feature Branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/${{ inputs.target_branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Solution Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: solution-export
+          path: solutions/unmanaged/${{ inputs.solution_name }}/
+
+      - name: Install Power Platform CLI
+        uses: microsoft/powerplatform-actions/actions-install@v1
+
+      - name: Authenticate to Dataverse
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 15
+          timeout_minutes: 5
+          command: |
+            $POWERPLATFORMTOOLS_PACPATH auth create \
+              --applicationId "${{ vars.POWERPLATFORM_APP_ID }}" \
+              --clientSecret "${{ secrets.POWERPLATFORM_CLIENT_SECRET }}" \
+              --tenant "${{ vars.POWERPLATFORM_TENANT_ID }}" \
+              --environment "${{ vars.DEV_ENV_URL }}"
+
+      - name: Generate Deployment Settings
         shell: bash
         run: |
-          echo "Generating deployment settings from $DEPLOYMENT_CONFIG ..."
+          CONFIG="solutions/deployment-config.json"
+          SETTINGS="solutions/unmanaged/${SOLUTION_NAME}/deployment-settings.json"
 
-          SETTINGS_FILE="solutions/unmanaged/${SOLUTION_NAME}/deployment-settings.json"
-
-          # Build the deployment settings JSON used by pac solution import
           jq '{
-            "EnvironmentVariables": (
-              [.environmentVariables | to_entries[] | {
-                "SchemaName": .key,
-                "Value": .value
-              }]
-            ),
-            "ConnectionReferences": (
-              [.connectionReferences | to_entries[] | {
-                "LogicalName": .key,
-                "ConnectionId": .value.connectionId,
-                "ConnectorId": .value.connectorId
-              }]
-            )
-          }' "$DEPLOYMENT_CONFIG" > "$SETTINGS_FILE"
+            "EnvironmentVariables": [.environmentVariables | to_entries[] | {"SchemaName": .key, "Value": .value}],
+            "ConnectionReferences": [.connectionReferences | to_entries[] | {"LogicalName": .key, "ConnectionId": .value.connectionId, "ConnectorId": .value.connectorId}]
+          }' "$CONFIG" > "$SETTINGS"
 
-          echo "✅ Deployment settings written to $SETTINGS_FILE"
-          cat "$SETTINGS_FILE"
-          echo "gen_settings" >> "$PROGRESS_FILE"
+          echo "✅ Deployment settings generated."
 
-      # ──────────────────────────────────────────────
-      # Import, Publish & Activate Components
-      # ──────────────────────────────────────────────
-      - name: Import Solution
-        if: steps.done.outputs.import != 'true'
+      - name: Find Solution ZIP
         shell: bash
         run: |
-          SETTINGS_FILE="solutions/unmanaged/${SOLUTION_NAME}/deployment-settings.json"
-
-          IMPORT_ARGS="--path ${TEMP_ZIP_PATH} --activate-plugins --force-overwrite --publish-changes"
-
-          if [[ -f "$SETTINGS_FILE" ]]; then
-            IMPORT_ARGS="$IMPORT_ARGS --settings-file $SETTINGS_FILE"
+          ZIP_PATH=$(find "solutions/unmanaged/${SOLUTION_NAME}/versions" -name "*.zip" | sort | tail -1)
+          if [[ -z "$ZIP_PATH" ]]; then
+            echo "::error::No solution ZIP found."
+            exit 1
           fi
+          echo "ZIP_PATH=$ZIP_PATH" >> "$GITHUB_ENV"
 
-          echo "Importing solution with args: $IMPORT_ARGS"
-          $POWERPLATFORMTOOLS_PACPATH solution import $IMPORT_ARGS
-
-          echo "import" >> "$PROGRESS_FILE"
+      - name: Import Solution
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 60
+          timeout_minutes: 30
+          command: |
+            SETTINGS="solutions/unmanaged/${SOLUTION_NAME}/deployment-settings.json"
+            IMPORT_ARGS="--path ${ZIP_PATH} --activate-plugins --force-overwrite --publish-changes"
+            if [[ -f "$SETTINGS" ]]; then
+              IMPORT_ARGS="$IMPORT_ARGS --settings-file $SETTINGS"
+            fi
+            $POWERPLATFORMTOOLS_PACPATH solution import $IMPORT_ARGS
 
       - name: Publish All Customizations
-        if: steps.done.outputs.publish != 'true'
-        shell: bash
-        run: |
-          echo "Publishing all customizations..."
-          $POWERPLATFORMTOOLS_PACPATH solution publish
-          echo "✅ All customizations published."
-          echo "publish" >> "$PROGRESS_FILE"
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 30
+          timeout_minutes: 10
+          command: |
+            $POWERPLATFORMTOOLS_PACPATH solution publish
 
-      - name: Activate Cloud Flows
-        if: steps.done.outputs.activate_flows != 'true'
+      - name: Activate Cloud Flows, Workflows & Business Rules
         shell: bash
         run: |
           echo "=========================================="
-          echo "  Activating Cloud Flows"
+          echo "  Activating Components Post-Deployment"
           echo "=========================================="
 
           SRC_DIR="solutions/unmanaged/${SOLUTION_NAME}/src"
           FLOW_FILES=$(find "$SRC_DIR" -path "*/Workflows/*" -name "*.json" 2>/dev/null || echo "")
-          ERRORS=0
 
-          if [[ -z "$FLOW_FILES" ]]; then
-            echo "No cloud flows found in solution."
-          else
-            while IFS= read -r flow_file; do
-              FLOW_NAME=$(jq -r '.name // empty' "$flow_file" 2>/dev/null)
-              FLOW_ID=$(jq -r '.workflowid // empty' "$flow_file" 2>/dev/null)
-              CATEGORY=$(jq -r '.category // empty' "$flow_file" 2>/dev/null)
-
-              # Category 5 = Modern Flow (Cloud Flow)
-              if [[ "$CATEGORY" == "5" && -n "$FLOW_ID" ]]; then
-                echo "  Turning on cloud flow: $FLOW_NAME ($FLOW_ID)..."
-                if ! $POWERPLATFORMTOOLS_PACPATH solution check --solution-name "${SOLUTION_NAME}" 2>/dev/null; then
-                  echo "::warning::Could not activate flow '$FLOW_NAME'. Manual activation may be required."
-                  ERRORS=$((ERRORS + 1))
-                fi
-              fi
-            done <<< "$FLOW_FILES"
-          fi
-
-          if [[ $ERRORS -gt 0 ]]; then
-            echo "::warning::$ERRORS flow(s) could not be activated automatically."
-          fi
-
-          echo "✅ Cloud flow activation complete."
-          echo "activate_flows" >> "$PROGRESS_FILE"
-
-      - name: Activate Plugins, Workflows & Business Rules
-        if: steps.done.outputs.activate_components != 'true'
-        shell: bash
-        run: |
-          echo "=========================================="
-          echo "  Activating Plugins, Workflows & Business Rules"
-          echo "=========================================="
-
-          SRC_DIR="solutions/unmanaged/${SOLUTION_NAME}/src"
-
-          # Activate classic workflows (category 0 = Workflow)
-          WORKFLOW_FILES=$(find "$SRC_DIR" -path "*/Workflows/*" -name "*.json" 2>/dev/null || echo "")
-          if [[ -n "$WORKFLOW_FILES" ]]; then
+          if [[ -n "$FLOW_FILES" ]]; then
             while IFS= read -r wf_file; do
               WF_NAME=$(jq -r '.name // empty' "$wf_file" 2>/dev/null)
               CATEGORY=$(jq -r '.category // empty' "$wf_file" 2>/dev/null)
-              STATE=$(jq -r '.statecode // empty' "$wf_file" 2>/dev/null)
-              if [[ "$CATEGORY" == "0" || "$CATEGORY" == "2" ]]; then
-                echo "  ✅ Workflow/Business Rule: $WF_NAME (category=$CATEGORY, state=$STATE)"
-              fi
-            done <<< "$WORKFLOW_FILES"
+              case "$CATEGORY" in
+                5) echo "  ✅ Cloud Flow: $WF_NAME" ;;
+                0) echo "  ✅ Workflow: $WF_NAME" ;;
+                2) echo "  ✅ Business Rule: $WF_NAME" ;;
+              esac
+            done <<< "$FLOW_FILES"
           fi
 
-          # Check plugin steps
-          PLUGIN_FILES=$(find "$SRC_DIR" -path "*/SdkMessageProcessingSteps/*" -name "*.json" 2>/dev/null || echo "")
-          if [[ -n "$PLUGIN_FILES" ]]; then
-            PLUGIN_COUNT=$(echo "$PLUGIN_FILES" | wc -l)
-            echo "  ✅ Found $PLUGIN_COUNT plugin step(s) in solution."
-          else
-            echo "  ℹ️  No plugin steps found."
-          fi
+          PLUGINS=$(find "$SRC_DIR" -path "*/SdkMessageProcessingSteps/*" -name "*.json" 2>/dev/null | wc -l || echo 0)
+          echo "  ✅ Plugin steps: $PLUGINS"
+          echo "=========================================="
+          echo "✅ All components activated via --activate-plugins and --publish-changes flags."
 
-          echo "✅ Component activation verification complete."
-          echo "activate_components" >> "$PROGRESS_FILE"
-
-      # ──────────────────────────────────────────────
-      # Commit & Push
-      # ──────────────────────────────────────────────
-      - name: Commit and Push Changes
-        shell: bash
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add "solutions/unmanaged/${SOLUTION_NAME}"
-          git add "$DEPLOYMENT_CONFIG" || true
-          if ! git diff --cached --quiet; then
-            git commit -m "Export ${SOLUTION_NAME} - ${VERSIONED_FILE_NAME}"
-            git pull --rebase origin "${TARGET_BRANCH}"
-            git push origin "HEAD:${TARGET_BRANCH}"
-          else
-            echo "No changes detected."
-          fi
-
-      # ──────────────────────────────────────────────
-      # Cleanup
-      # ──────────────────────────────────────────────
       - name: Clear Authentication
         if: always()
         shell: bash
         run: $POWERPLATFORMTOOLS_PACPATH auth clear || true
 
-      - name: Save Progress
-        if: always()
-        uses: actions/cache/save@v4
+  # ════════════════════════════════════════════════════
+  # Job 5 — Commit & push to feature branch
+  # ════════════════════════════════════════════════════
+  commit-and-push:
+    needs: import-and-activate
+    runs-on: ubuntu-latest
+    env:
+      SOLUTION_NAME: ${{ inputs.solution_name }}
+    steps:
+      - name: Checkout Target Feature Branch
+        uses: actions/checkout@v4
         with:
-          path: .step-progress
-          key: export-progress-${{ inputs.solution_name }}-${{ inputs.target_branch }}-${{ github.run_number }}
+          ref: feature/${{ inputs.target_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Solution Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: solution-export
+          path: solutions/unmanaged/${{ inputs.solution_name }}/
+
+      - name: Commit and Push Changes
+        shell: bash
+        run: |
+          TARGET="feature/${{ inputs.target_branch }}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add "solutions/unmanaged/${SOLUTION_NAME}"
+          if ! git diff --cached --quiet; then
+            TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
+            git commit -m "Export ${SOLUTION_NAME} - ${TIMESTAMP}_Run${{ github.run_number }}"
+            git pull --rebase origin "${TARGET}"
+            git push origin "HEAD:${TARGET}"
+            echo "✅ Changes pushed to ${TARGET}."
+          else
+            echo "No changes detected."
+          fi
